@@ -1,0 +1,508 @@
+---
+title: "Stacking ML for pelvic mass diagnosis"
+author: "Reid Shaw"
+date: "2/20/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(readxl)
+library(skimr)
+library(corrplot)
+library(RColorBrewer)
+library(ggridges)
+
+theme_set(theme_light())
+
+complete_df <- read_excel("OBMT_20200913.xlsx", sheet = 2, skip = 2)
+
+df <- complete_df %>%
+     mutate(diagnosis = case_when(diagnosis == "Benign" ~ "Benign",
+                                  diagnosis != "Benign" ~ "Cancer"),
+            age = case_when(age == "." ~ "", 
+                            age != "." ~ age),
+            age = as.numeric(age),
+            eia_he4 = case_when(eia_he4 == "." ~ "",
+                                eia_he4 != "." ~ eia_he4),
+            eia_he4 = as.numeric(eia_he4)) %>%
+     mutate_if(is.character, factor) %>%
+     select(diagnosis, arch_ca125, eia_he4, wih_trf) 
+
+
+skim(df)
+```
+
+
+#Splitting data into training and testing
+```{r}
+set.seed(420)
+
+df_split <- initial_split(df, strata = diagnosis)
+df_split
+
+df_train <- training(df_split) 
+df_test <- testing(df_split) 
+
+set.seed(69)
+df_bootstrap <- bootstraps(df_train, times = 25, strata = diagnosis)
+
+```
+
+
+#Hyperparameter tuning
+```{r}
+grid_size <- 50
+
+model_control <- control_grid(save_pred = T, save_workflow = T, event_level = "second")
+```
+
+
+# Tune XGBoost
+```{r}
+xgboost_recipe <- 
+     recipe(formula = diagnosis ~ ., data = df_train) %>% 
+     step_knnimpute(eia_he4)
+
+xgboost_spec <- 
+     boost_tree(trees = 1000, min_n = c(1:5), tree_depth = tune(), learn_rate = tune(), 
+                loss_reduction = tune(), sample_size = tune(), mtry = tune()) %>% 
+     set_engine("xgboost") %>%
+     set_mode("classification")
+
+xgboost_grid <- grid_latin_hypercube(tree_depth(),
+                                     loss_reduction(),
+                                     sample_size = sample_prop(),
+                                     finalize(mtry(), df_train),
+                                     learn_rate(),
+                                     size = grid_size)
+
+xgboost_wf <- 
+     workflow() %>% 
+     add_recipe(xgboost_recipe) %>% 
+     add_model(xgboost_spec) 
+
+doParallel::registerDoParallel()
+
+set.seed(420)
+xgboost_tune <-
+     tune_grid(xgboost_wf, 
+               grid = xgboost_grid,
+               resamples = df_bootstrap,
+               control = model_control)
+     
+
+show_best(xgboost_tune)
+```
+
+
+
+# Tune GLM
+```{r}
+glm_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_BoxCox(all_predictors()) %>%
+     step_knnimpute(eia_he4) #Imputed missing age and eia_he4 value
+
+
+glm_spec <- 
+     logistic_reg(penalty = tune(), mixture = tune()) %>% 
+     set_mode("classification") %>% 
+     set_engine("glmnet") 
+
+glm_wf <- 
+     workflow() %>% 
+     add_recipe(glm_rec) %>% 
+     add_model(glm_spec) 
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, 
+                                                length.out = 20), 
+                               mixture = c(0.05, 0.2, 0.4, 0.6, 0.8, 0.95)) 
+
+set.seed(420)
+glm_tune <- 
+     tune_grid(glm_wf, 
+               resamples = df_bootstrap, 
+               grid = glmnet_grid,
+               control = model_control)
+
+show_best(glm_tune)
+```
+
+
+# Tune Random Forest 
+```{r}
+rf_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4) #Imputed missing age and eia_he4 value
+
+rf_spec <- rand_forest(mtry = tune(), 
+                       min_n = tune(), 
+                       trees = 1000) %>% 
+     set_mode("classification") %>% 
+     set_engine("ranger") 
+
+rf_grid <- grid_latin_hypercube(min_n(),
+                                finalize(mtry(), df_train),
+                                size = grid_size)
+
+rf_wf <- 
+     workflow() %>% 
+     add_recipe(rf_rec) %>% 
+     add_model(rf_spec) 
+
+set.seed(420)
+rf_tune <- 
+     tune_grid(rf_wf, 
+               resamples = df_bootstrap, 
+               grid = rf_grid,
+               control = model_control)
+
+show_best(rf_tune)
+```
+
+
+
+# Tune Decision Tree
+```{r}
+tree_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4)
+
+
+tree_spec <- decision_tree(tree_depth = tune(),
+                           cost_complexity = tune(),
+                           min_n = tune()) %>%
+     set_mode("classification") %>%
+     set_engine("rpart")
+
+
+tree_grid <- grid_latin_hypercube(tree_depth(),
+                                  cost_complexity(),
+                                  min_n(),
+                                  size = grid_size)
+
+tree_wf <- workflow() %>%
+     add_recipe(tree_rec) %>%
+     add_model(tree_spec)
+
+set.seed(420)
+tree_tune <- tune_grid(
+     tree_wf,
+     resamples = df_bootstrap,
+     grid = tree_grid,
+     control = model_control)
+
+show_best(tree_tune)
+```
+
+
+
+# Tune MARS
+```{r}
+mars_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4)
+
+earth_spec <- 
+     mars(num_terms = tune(), prod_degree = tune(), prune_method = "none") %>% 
+     set_mode("classification") %>% 
+     set_engine("earth") 
+
+earth_wf <- 
+     workflow() %>% 
+     add_recipe(mars_rec) %>% 
+     add_model(earth_spec) 
+
+earth_grid <- tidyr::crossing(num_terms = 2 * (1:6), prod_degree = 1:2) 
+
+set.seed(420)
+earth_tune <- 
+     tune_grid(earth_wf, 
+               resamples = df_bootstrap, 
+               grid = earth_grid,
+               control = model_control) 
+
+show_best(earth_tune)
+```
+
+
+#Tune Naive Bayes
+```{r}
+library(discrim)
+nb_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4)
+
+naive_bayes_spec <- naive_Bayes(smoothness = tune(), 
+                                Laplace = tune()) %>%
+     set_engine("naivebayes")
+
+nb_grid <- grid_latin_hypercube(smoothness(),
+                                Laplace(), 
+                                size = grid_size)
+
+nb_wf <- workflow() %>%
+     add_recipe(nb_rec) %>%
+     add_model(naive_bayes_spec)
+
+set.seed(420)
+nb_tune <- tune_grid(nb_wf,
+                     resamples = df_bootstrap,
+                     grid = nb_grid,
+                     control = model_control)
+
+show_best(nb_tune)
+```
+
+
+
+# Tune Neural Net
+```{r}
+nnet_rec <- 
+     recipe(diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4) %>% 
+     step_BoxCox(all_predictors())%>%
+     prep(training = df_train, retain = TRUE)
+
+nnet_spec <- mlp(hidden_units = 2,
+                 dropout = 0.3,
+                 epochs = 100) %>%
+     set_mode("classification") %>%
+     set_engine("keras")
+
+nnet_wf <- workflow() %>%
+     add_recipe(nnet_rec) %>%
+     add_model(nnet_spec)
+
+set.seed(420)
+nnet_tune <- tune_grid(nnet_wf,
+                       resamples = df_bootstrap,
+                       control = model_control)
+
+show_best(nnet_tune)
+```
+
+
+# Tune polynomial SVM
+```{r}
+svm_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_BoxCox(all_predictors()) %>%
+     step_knnimpute(eia_he4) 
+
+svm_spec <- svm_poly(cost = tune(),
+                     degree = tune(),
+                     scale_factor = tune()) %>%
+     set_mode("classification") %>%
+     set_engine("kernlab")
+
+
+svm_grid <- grid_latin_hypercube(degree(),
+                                 scale_factor(),
+                                 cost(),
+                                 size = grid_size)
+
+svm_wf <- workflow() %>%
+     add_recipe(svm_rec) %>%
+     add_model(svm_spec)
+
+set.seed(420)
+svm_tune <- tune_grid(svm_wf,
+                      resamples = df_bootstrap,
+                      grid = svm_grid,
+                      control = model_control)
+
+show_best(svm_tune)
+```
+
+
+# Tune C5 rules
+```{r}
+library(rules)
+c5_rec <- recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(eia_he4) 
+
+c5_spec <- C5_rules(trees = tune(),
+                    min_n = tune()) %>%
+     set_engine("C5.0")
+
+c5_grid <- tidyr::crossing(trees = c(20,40,60,80,100),
+                           min_n = c(1,2,3,5,7,9))
+
+c5_wf <- workflow() %>%
+     add_recipe(c5_rec) %>%
+     add_model(c5_spec)
+
+c5_tune <- tune_grid(c5_wf,
+                     resamples = df_bootstrap,
+                     grid = c5_grid,
+                     control = model_control)
+
+show_best(c5_tune, metric = "roc_auc")
+```
+
+
+#Figure 2A
+```{r}
+result_list <- list(xgboost_tune, svm_tune, nnet_tune, nb_tune, earth_tune, tree_tune, glm_tune, rf_tune, c5_tune)
+
+names(result_list) <- c("XGBoost","Polynomial SVM", "Neural Net", "Naive Bayes", "MARS", "Decision Tree", "Elastic Net", "Random Forest", "C5.0 Rule-Based")
+
+predictions <- result_list %>%
+     map_dfr(collect_predictions, .id = "model")
+
+predictions %>%
+     group_by(id, model) %>%
+     roc_curve(diagnosis, .pred_Cancer, event_level = "second") %>%
+     ggplot(aes(1 - specificity, sensitivity, color = model)) +
+     geom_abline(lty = 2, color = "gray80", size = 1.5) +
+     geom_path(show.legend = F, alpha = 0.8) +
+     scale_colour_manual(values= colors) + 
+     coord_equal() +
+     labs(x = "1- Specificity",
+          y = "Sensitivity") +
+     facet_wrap(~model, nrow = 3) + 
+     theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+#Figure 2B
+```{r}
+metrics <- result_list %>%
+     map_dfr(collect_metrics, .id = "model") %>%
+     select(model, .metric, mean)
+
+metrics %>%
+     #mutate(model = fct_reorder(model, desc)) %>%
+     ggplot(aes(reorder(model, desc(model)), mean, color = model)) +
+     geom_boxplot() +
+     geom_jitter(alpha = 0.7, width = 0.2) +
+     coord_flip() +
+     labs(y = "",
+          x = "") +
+     theme(legend.position = "none") +
+     scale_colour_manual(values= colors) +
+     facet_wrap(~.metric, scales = "free_x",
+                labeller = labeller(.metric = c("accuracy" = "Accuracy",
+                                                "roc_auc" = "ROC AUC"))) +
+     theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+# Stacking multiple models
+```{r}
+library(stacks)
+set.seed(420)
+model_stack <- 
+     stacks() %>%
+     add_candidates(rf_tune, "RF") %>%
+     add_candidates(c5_tune, "C5") %>%
+     add_candidates(svm_tune, "SVM") %>%
+     add_candidates(nb_tune, "NB") %>%
+     add_candidates(earth_tune, "MARS") %>%
+     add_candidates(tree_tune, "Trees") %>%
+     add_candidates(nnet_tune, "NN") %>%
+     add_candidates(glm_tune, "EN") %>%
+     blend_predictions() %>%
+     fit_members()
+```
+
+
+#Figure 2C
+```{r}
+autoplot(model_stack, type = "weights", fill = model) +
+     labs(title = "",
+          fill = "Model") +
+     scale_fill_manual(values=c("#721F81FF", "#F1605DFF"), labels = c("NB", "SVM")) +
+     theme(axis.text.y=element_blank(),
+           axis.ticks.y=element_blank(),
+           axis.title.y = element_blank(),
+           legend.justification=c(1,0), legend.position=c(1,0),
+           legend.background = element_rect(fill = "transparent"))
+
+```
+
+# Model stack on testing data
+```{r}
+df_predictions <-
+     df_test %>%
+     bind_cols(predict(model_stack, ., type = "prob"))
+
+stack_preds <-
+     df_test %>%
+     select(diagnosis) %>%
+     bind_cols(
+          predict(
+               model_stack,
+               df_test,
+               type = "prob",
+               members = TRUE
+          )
+     )
+
+stack_auc <- stack_preds %>%
+     select(diagnosis, contains(".pred_Cancer")) %>%
+     pivot_longer(!diagnosis) %>%
+     group_by(name) %>%
+     yardstick::roc_auc(., truth = diagnosis, value, event_level = "second") %>%
+     select(name, .estimate) %>%
+     mutate(name = case_when(name == ".pred_Cancer" ~ "Ensemble",
+                             name == ".pred_Cancer_SVM_1_13" ~ "SVM",
+                             name == ".pred_Cancer_NB_1_28" ~ "NB")) %>%
+     rename(auc = ".estimate",
+            model = "name")
+```
+
+
+# Figure 3B
+```{r}
+df_test %>%
+     bind_cols(predict(model_stack, ., type = "class")) %>%
+     mutate_if(is.factor, as.character) %>%
+     mutate(diagnosis = case_when(diagnosis == "Cancer" ~ " Cancer",
+                                  diagnosis != "Cancer" ~ diagnosis),
+            .pred_class = case_when(.pred_class == "Cancer" ~ " Cancer",
+                                    .pred_class != "Cancer" ~ .pred_class)) %>%
+     mutate_if(is.character, as.factor) %>%
+     conf_mat(diagnosis, .pred_class) %>%
+     autoplot(type = "heatmap") +
+     scale_fill_distiller(palette = "RdYlBu")
+```
+
+
+#Figure 3C
+```{r}
+to_join <- complete_df %>%
+     mutate(eia_he4 = case_when(eia_he4 == "." ~ "",
+                                eia_he4 != "." ~ eia_he4),
+            eia_he4 = as.numeric(eia_he4)) 
+
+df_test %>%
+     bind_cols(predict(model_stack, ., type = "class", members = T))
+
+
+df_pred_plot <- df_test %>%
+     bind_cols(predict(model_stack, ., type = "class", members = T)) %>%
+     rename(prediction = .pred_class) %>%
+     mutate(pred_outcome = case_when(diagnosis == "Cancer" & prediction == "Cancer" ~ "True Postive",
+                                     diagnosis == "Benign" & prediction == "Benign" ~ "True Negative",
+                                     diagnosis == "Cancer" & prediction == "Benign" ~ "False Negative",
+                                     diagnosis == "Benign" & prediction == "Cancer" ~ "False Positive"))%>%
+     left_join(to_join, by = c("arch_ca125", "eia_he4", "wih_trf"))
+
+df_pred_plot %>%
+     ggplot(aes(arch_ca125, eia_he4, color = pred_outcome)) +
+     geom_point(aes(size = wih_trf), alpha = 0.7) +
+     scale_color_manual(values = c("dodgerblue", "red3", "darkgoldenrod1")) +
+     geom_text(aes(label = paste(diagnosis.y)), 
+               data = subset(df_pred_plot, pred_outcome %in% c("False Negative")),
+               nudge_x = 1,
+               check_overlap = T,
+               show.legend = F) +
+     scale_y_log10() +
+     scale_x_log10() +
+     labs(x = "CA125",
+          y = "HE4",
+          color = "Prediction Result",
+          size = "Transferrin") +
+     guides(colour = guide_legend(override.aes = list(size=3)))
+```
+
+

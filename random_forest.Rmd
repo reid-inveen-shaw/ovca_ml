@@ -1,0 +1,192 @@
+---
+title: "RF Bayes optimization"
+author: "Reid Shaw"
+date: "12/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache= TRUE, cache.lazy = FALSE, warning = FALSE,
+                      message = FALSE, echo = TRUE, dpi = 180)
+
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(usemodels)
+library(readxl)
+library(skimr)
+library(doParallel)
+library(ranger)
+library(glmnet)
+library(vip)
+
+theme_set(theme_light())
+```
+
+
+# Cleaning the data
+
+```{r}
+setwd("/Users/reidshaw/Desktop/ov_ca_ml/data")
+
+df <- read_excel("OBMT_20200913.xlsx", sheet = 2, skip = 2)
+df[df == "."] <- NA
+
+df <- df %>%
+     mutate(diagnosis = case_when(diagnosis == "Benign" ~ "Benign",
+                                  diagnosis != "Benign" ~ "Cancer")) %>%
+     select(diagnosis, age, postmeno, arch_ca125:wih_trf, lpaTots:upmc_lactoferrin) %>%
+     mutate(diagnosis = as.factor(diagnosis)) %>% 
+     mutate_if(is.character, as.numeric)
+```
+
+
+
+
+# Build a Random Forest
+
+# Will use all variables
+
+#Splitting the data
+```{r}
+set.seed(420)
+
+df_split <- initial_split(df, strata = diagnosis)
+df_split
+
+df_train <- training(df_split) 
+df_test <- testing(df_split) 
+
+set.seed(69)
+df_bootstrap <- bootstraps(df_train, times = 25, strata = diagnosis)
+df_bootstrap
+
+```
+
+
+# RF workflow
+```{r}
+ranger_recipe <- 
+     recipe(formula = diagnosis ~ ., data = df_train) %>%
+     step_knnimpute(all_predictors()) %>%
+     step_nzv(all_predictors()) 
+
+ranger_spec <- rand_forest(mtry = tune(), 
+                           min_n = tune(), 
+                           trees = tune()) %>% 
+     set_mode("classification") %>% 
+     set_engine("ranger") 
+
+ranger_workflow <- 
+     workflow() %>% 
+     add_recipe(ranger_recipe) %>% 
+     add_model(ranger_spec) 
+
+rf_set <- parameters(ranger_workflow)
+rf_set <- rf_set %>% 
+     update(mtry = finalize(mtry(), df_train))
+
+
+set.seed(420)
+#Iterative Bayesian optimization
+search_res <-
+  ranger_workflow %>% 
+  tune_bayes(
+    resamples = df_bootstrap,
+    # To use non-default parameter ranges
+    param_info = rf_set,
+    # Generate five at semi-random to start
+    initial = 5,
+    iter = 50,
+    # How to measure performance?
+    metrics = metric_set(roc_auc),
+    control = control_bayes(no_improve = 30, save_pred = T, save_workflow = T)
+  )
+
+```
+
+#Figure 1A
+```{r}
+search_res %>% 
+     collect_metrics() %>% 
+     select(mtry, trees, min_n, mean) %>%
+     pivot_longer(!mean, names_to = "parameter", values_to = "value") %>%
+     rename(auc = mean) %>%
+     ggplot(aes(value, auc, color = parameter)) +
+     geom_point(alpha = 0.7, size = 3) +
+     facet_wrap(~parameter, 
+                scales = "free_x",
+                labeller = labeller(parameter = 
+                                         c("min_n" = "Node Size",
+                                           "trees" = "# of Trees",
+                                           "mtry" = "# of Predictors"))) +
+     scale_color_viridis_d(begin = 0.8, end = 0, option = "D") +
+     labs(x = "",
+          y = "ROC AUC") +
+     theme(legend.position = "none")
+```
+
+
+#Figure 1B
+```{r}
+predictions <- collect_predictions(search_res)
+
+predictions %>%
+     group_by(id) %>%
+     roc_curve(diagnosis, .pred_Cancer, event_level = "second") %>%
+     ggplot(aes(1 - specificity, sensitivity, color = id)) +
+     geom_abline(lty = 2, color = "gray80", size = 1.5) +
+     geom_path(show.legend = F, alpha = 0.5) +
+     coord_equal() +
+     labs(x = "1- Specificity",
+          y = "Sensitivity") +
+     scale_color_viridis_d(begin = 0.8, end = 0, option = "D") 
+
+```
+
+#Figure 1C
+```{r}
+best_auc <- select_best(ranger_tune, "roc_auc")
+
+final_rf <- finalize_model(ranger_spec, best_auc)
+
+ranger_vi <- function(seed){
+     set.seed(seed)
+     
+     final_rf %>%
+     set_engine("ranger", importance = "permutation") %>%
+     fit(diagnosis ~ ., 
+         data = df_train) %>%
+     vi()
+}
+
+vi <- data.frame(seed = rep(1:1000))
+
+vi_df <- vi %>%
+     mutate(variable = map(seed, ranger_vi )) %>%
+     unnest(variable)
+
+
+vi_df %>% 
+     group_by(Variable) %>%
+     mutate(mean = mean(abs(Importance)))  %>%
+     ungroup() %>%
+     mutate(Variable = str_split(Variable, pattern = "_", n = 2),
+            Variable = sapply(Variable, "[", 2 ),
+            Variable = toupper(Variable),
+            Variable = fct_lump(Variable, n = 10, w = mean),
+            Variable = fct_reorder(Variable, mean),
+            Importance = Importance / max(Importance)) %>%
+     drop_na() %>%
+     ggplot(aes(Variable, Importance, color = Variable)) +
+     geom_boxplot(outlier.shape = NA) +
+     geom_jitter(alpha = 0.01, width = 0.3, aes(color = Variable)) +
+     coord_flip() + 
+     theme(legend.position = "none") +
+     labs(y = "Relative Variable Imporance",
+          x = "",
+          title = "") +
+     scale_color_viridis_d(begin = 0.8, end = 0, option = "D")
+
+
+```

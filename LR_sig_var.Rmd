@@ -1,0 +1,228 @@
+---
+title: "compare_individual_predictors"
+author: "Reid Shaw"
+date: "11/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache= TRUE, cache.lazy = FALSE, warning = FALSE,
+                      message = FALSE, echo = TRUE, height = 5, width = 8, dpi = 300)
+
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(readxl)
+library(skimr)
+library(corrplot)
+library(RColorBrewer)
+library(ggrepel)
+library(workflowsets)
+
+theme_set(theme_light())
+```
+
+
+
+```{r}
+complete_df <- read_excel("OBMT_20200913.xlsx", sheet = 2, skip = 2)
+
+df <- complete_df %>%
+     mutate(diagnosis = case_when(diagnosis == "Benign" ~ "Benign",
+                                  diagnosis != "Benign" ~ "Cancer")) %>%
+     select(diagnosis, age, postmeno, arch_ca125:wih_trf, lpaTots:upmc_lactoferrin) %>%
+     mutate(across(everything(), na_if, ".")) %>%
+     mutate(across(-c(diagnosis), as.numeric)) %>%
+     mutate_if(is.character, factor)
+
+```
+
+
+
+# Volcano plot
+```{r}
+volcano <- df %>%
+     pivot_longer(!diagnosis, names_to = "variable", values_to = "count") %>%
+     drop_na() %>%
+     group_by(diagnosis, variable) %>%
+     nest() %>%
+     spread(key = diagnosis, value = data) %>%
+     mutate(
+          t_test = map2(Benign, Cancer, ~{t.test(.x$count, .y$count) %>% tidy()}),
+          Benign = map(Benign, sum),
+          Cancer = map(Cancer, sum)
+     ) %>%
+     unnest() %>%
+     mutate(p_corrected = round(p.adjust(p.value, "BH"), 10),
+          log_pval = -log10(p_corrected),
+            Benign = (Benign / table(df$diagnosis)[[1]]),
+            Cancer = (Cancer / table(df$diagnosis)[[2]]),
+            fc = log2(Benign / Cancer),
+          name  = sub(".*?_", "", variable),
+          abs_diff = abs(Benign - Cancer)) 
+
+
+volcano$highlight <- ifelse(volcano$p_corrected < 0.01 , 
+                                     "highlight", "normal")
+
+mycolours <- c("highlight" = "midnightblue", "normal" = "grey50")
+
+library(stringr)
+
+volcano_plot <- volcano %>%
+     mutate(variable = str_remove(variable, "upmc_")) %>%
+     mutate(variable = str_remove(variable, "arch_")) %>%
+     mutate(variable = str_remove(variable, "eia_")) %>% 
+     mutate(variable = str_remove(variable, "wih_"))
+
+volcano_plot %>%
+     ggplot(aes(fc, log_pval, label = variable)) +
+     geom_point(size = 3, aes(colour = highlight, alpha = 0.8)) +
+     scale_color_manual(values = mycolours) +
+     geom_text_repel(data = subset(volcano_plot, p_corrected < 0.01)) +
+     xlab("Log 2 (Benign / Cancer)") +
+     ylab("-Log 10 P-value Corrected") +
+     ggtitle("Variable Volcano Plot") +
+     theme(legend.position = "none")
+
+```
+
+
+
+```{r}
+set.seed(420)
+
+df <- df %>%
+     select(diagnosis, name$variable)
+
+df_split <- initial_split(df, strata = diagnosis)
+df_split
+
+df_train <- training(df_split) 
+df_test <- testing(df_split) 
+
+set.seed(69)
+df_bootstrap <- bootstraps(df, times = 25, strata = diagnosis)
+df_bootstrap
+```
+
+
+```{r}
+lr_model <- logistic_reg() %>% set_engine("glm")
+
+formulas <- leave_var_out_formulas(diagnosis ~ ., data = df)
+length(formulas)
+
+class_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+
+workflows <- 
+   workflow_set(
+      preproc = formulas, 
+      models = list(logistic = lr_model)
+   )
+
+workflows
+
+workflows <- 
+   workflows %>% 
+   workflow_map("fit_resamples", 
+                resamples = df_bootstrap,
+                metrics = class_metrics,
+                seed = 69)
+
+workflows
+
+```
+
+```{r}
+
+roc_values <- 
+     workflows %>% 
+     collect_metrics(summarize = FALSE) %>% 
+     filter(.metric == "roc_auc") %>% 
+     mutate(wflow_id = gsub("_logistic", "", wflow_id))
+
+roc_values %>%
+     group_by(wflow_id) %>%
+     mutate(mean_auc = mean(.estimate)) %>%
+     select(wflow_id, mean_auc) %>%
+     distinct() %>%
+     arrange(mean_auc)
+     
+full_model <- 
+  roc_values %>% 
+  filter(wflow_id == "everything") %>% 
+  select(full_model = .estimate, id)
+
+differences <- 
+  roc_values %>% 
+  filter(wflow_id != "everything") %>% 
+  full_join(full_model, by = "id") %>% 
+  mutate(performance_drop = full_model - .estimate)
+
+summary_stats <- 
+     differences %>% 
+     group_by(wflow_id) %>% 
+     summarize(
+          std_err = sd(performance_drop)/sum(!is.na(performance_drop)),
+          performance_drop = mean(performance_drop),
+          lower = performance_drop - qnorm(0.975) * std_err,
+          upper = performance_drop + qnorm(0.975) * std_err,
+          .groups = "drop"
+     ) %>% 
+     mutate(
+          wflow_id = sub("upmc_", "", wflow_id),
+          wflow_id = sub("arch_", "", wflow_id),
+          wflow_id = sub("eia_", "", wflow_id),
+          wflow_id = sub("wih_", "", wflow_id),
+          wflow_id = toupper(wflow_id),
+          wflow_id = factor(wflow_id),
+          wflow_id = reorder(wflow_id, performance_drop)
+     )
+
+ggplot(summary_stats, aes(x = performance_drop, y = wflow_id)) + 
+     geom_point() + 
+     geom_errorbar(aes(xmin = lower, xmax = upper), width = .25) +
+     ylab("") +
+     xlab("Performance Drop")
+
+```
+
+
+
+
+```{r}
+
+spec_sens_values <- workflows %>%
+     collect_metrics(summarize = FALSE) %>%
+     filter(.metric %in% c("sens", "spec")) %>%
+     select(wflow_id, .metric, .estimate) %>%
+     mutate(wflow_id = gsub("_logistic", "", wflow_id)) %>%
+     group_by(wflow_id, .metric) %>%
+     summarize(mean = mean(.estimate)) %>%
+     pivot_wider(names_from = .metric, values_from = mean) %>%
+     mutate(wflow_id = sub("upmc_", "", wflow_id),
+          wflow_id = sub("arch_", "", wflow_id),
+          wflow_id = sub("eia_", "", wflow_id),
+          wflow_id = sub("wih_", "", wflow_id))
+
+spec_sens_values$highlight <- ifelse(spec_sens_values$wflow_id == "everything", 
+                                     "highlight", "normal")
+
+textdf <- spec_sens_values[spec_sens_values$wflow_id == "everything", ]
+mycolours <- c("highlight" = "red", "normal" = "grey50")
+     
+spec_sens_values %>%
+     ggplot(aes(x = spec, y = sens, label = wflow_id)) + 
+     geom_point(size = 3, aes(colour = highlight)) +
+     scale_color_manual("Status", values = mycolours) +
+     geom_text_repel() +
+     ylab("Sensitivity") +
+     xlab("Specificity") +
+     theme(legend.position = "none")
+
+```
+
+
+
+
